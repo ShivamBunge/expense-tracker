@@ -55,7 +55,7 @@ function acquireLock(lockName = 'expense-bot') {
     process.on('SIGINT', () => process.exit(0));
     process.on('SIGTERM', () => process.exit(0));
 
-    return { lockPath };
+    return { lockPath, releaseLock: cleanup };
 }
 
 module.exports = { acquireLock };

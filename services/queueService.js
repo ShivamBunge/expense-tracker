@@ -79,8 +79,13 @@ function createSheetsWriter({ writeFn, queueFileAbs, maxAttempts = 6 }) {
                 });
             }
 
-            queue.rewrite(remaining);
-            return { ok: true, wrote, remaining: remaining.length };
+                        // Before overwriting, merge any items that were enqueued while we flushed.
+            const afterSnapshot = queue.readAll();
+            const existingIds = new Set(items.map(i => i.id));
+            const newlyArrived = afterSnapshot.filter(i => !existingIds.has(i.id));
+            const merged = [...remaining, ...newlyArrived];
+            queue.rewrite(merged);
+            return { ok: true, wrote, remaining: merged.length };
         } finally {
             flushing = false;
         }

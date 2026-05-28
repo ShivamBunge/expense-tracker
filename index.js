@@ -3,6 +3,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
+const { fork } = require('child_process');
 const { isValidExpense, parseExpense } = require('./services/parserService');
 const { appendToSheet } = require('./services/sheetsService');
 const { acquireLock } = require('./services/singleInstance');
@@ -16,8 +17,9 @@ if (!spreadsheetId) {
 }
 
 // Ensure only one instance runs (prevents session lock & duplicates).
+let lock;
 try {
-    acquireLock('expense-bot');
+    lock = acquireLock('expense-bot');
 } catch (e) {
     console.error(e?.message || e);
     process.exit(1);
@@ -34,6 +36,7 @@ if (KILL_ZOMBIE_CHROME) {
 let client;
 let reconnectAttempt = 0;
 let reconnectTimer = null;
+let resettingAuth = false;
 const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 5_000);
 const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 120_000);
 
@@ -44,6 +47,7 @@ function computeReconnectDelayMs(attempt) {
 }
 
 function scheduleReconnect(reason) {
+    if (resettingAuth) return;
     if (reconnectTimer) return;
     const delay = computeReconnectDelayMs(reconnectAttempt);
     console.error(`[reconnect] scheduling reconnect in ${delay}ms (attempt=${reconnectAttempt}) reason=${reason}`);
@@ -125,9 +129,13 @@ async function handleExpenseMessage(sourceEvent, msg) {
             const chatId = msg.fromMe ? msg.to : msg.from;
             if (chatId !== SELF_CHAT_ID) return;
         } else {
-            // Fallback: only allow messages that look like "self chat" in older id formats.
-            const isLegacySelfChat = msg.fromMe && msg.to === msg.from;
-            if (!isLegacySelfChat) return;
+            // If message is from you (fromMe === true), it's a self-chat message.
+            // This covers both legacy (msg.to === msg.from) and @lid formats.
+            // Only reject if the message appears to be from someone else.
+            if (!msg.fromMe) {
+                const isNotSelfChat = msg.from !== msg.to;
+                if (isNotSelfChat) return;
+            }
         }
     }
 
@@ -150,36 +158,50 @@ async function handleExpenseMessage(sourceEvent, msg) {
         return;
     }
 
-    if (/^reset\s+auth$/i.test(text)) {
+        if (/^reset\s+auth$/i.test(text)) {
         if (!ALLOW_AUTH_RESET) {
             await msg.reply('❌ Auth reset is disabled. Set ALLOW_AUTH_RESET=true in .env to enable it.');
             return;
         }
 
+        resettingAuth = true;
         try {
-            // Best-effort attempt to logout from WhatsApp Web.
-            // Even if it fails, removing LocalAuth will force QR login next start.
-            await client.logout().catch(() => undefined);
-        } finally {
+            // 1. Destroy client to release Chrome and file handles
+            if (client) {
+                try { await client.destroy(); } catch {}
+                client = null;
+            }
+            // 2. Kill any leftover zombie Chrome
+            if (KILL_ZOMBIE_CHROME) {
+                killZombieChromeForSession(SESSION_DIR);
+            }
+            // 3. Wait for files to unlock
+            await new Promise(r => setTimeout(r, 1000));
+            // 4. Remove auth folder
             const authDir = path.join(__dirname, '.wwebjs_auth');
             try {
                 fs.rmSync(authDir, { recursive: true, force: true });
             } catch (e) {
                 console.error('[reset_auth] Failed to remove auth folder', e);
             }
+        } catch (e) {
+            console.error('[reset_auth] Cleanup error', e);
         }
 
         await msg.reply(
             '✅ Auth reset done.\n' +
-                'Now restart the bot. It will print a QR code; re-link via WhatsApp → Linked devices → Link a device.'
+                'Restarting now. Scan the new QR code via WhatsApp → Linked devices → Link a device.'
         );
-        // Exit so a process manager (or you) can restart cleanly.
-        process.exit(0);
+        // Release the lock and spawn a fresh instance.
+        if (lock?.releaseLock) lock.releaseLock();
+        spawnRestart();
+        return;
     }
 
     if (!isValidExpense(text)) return;
 
     const parsedData = parseExpense(text);
+    if (!parsedData) return; // invalid or zero amount
 
     const metaId = msg?.id?._serialized || msg?.id?.id;
     const out = await sheetsWriter.recordAndFlush(parsedData, {
@@ -209,10 +231,10 @@ function wireClientHandlers(c) {
         qrcode.generate(qr, { small: true });
     });
 
-    c.on('ready', () => {
-        reconnectAttempt = 0;
-        console.log('Expense Bot is authenticated, live, and listening for inputs!');
-    });
+        c.on('ready', () => {
+            reconnectAttempt = 0;
+            console.log('Expense Bot is authenticated, live, and listening for inputs!');
+        });
 
     c.on('authenticated', () => console.log('[authenticated] WhatsApp session authenticated'));
     c.on('auth_failure', (m) => {
@@ -221,28 +243,92 @@ function wireClientHandlers(c) {
         // user can send "reset auth" (if enabled) or manually delete auth folder.
         scheduleReconnect('auth_failure');
     });
-    c.on('disconnected', (reason) => {
-        console.error('[disconnected]', reason);
-        scheduleReconnect(`disconnected:${reason}`);
-    });
+        c.on('disconnected', async (reason) => {
+            console.error('[disconnected]', reason);
+
+            // On LOGOUT (user unlinked from phone): clean everything and restart fresh.
+            if (/logout/i.test(String(reason))) {
+                console.log('[disconnected] Device was unlinked from WhatsApp. Wiping auth and restarting...');
+                try {
+                    if (client) {
+                        try { await client.destroy(); } catch {}
+                        client = null;
+                    }
+                    if (KILL_ZOMBIE_CHROME) {
+                        killZombieChromeForSession(SESSION_DIR);
+                    }
+                    // Wait for Chrome to fully exit and release file locks.
+                    await new Promise(r => setTimeout(r, 2000));
+                    const authDir = path.join(__dirname, '.wwebjs_auth');
+                    try {
+                        fs.rmSync(authDir, { recursive: true, force: true });
+                        console.log('[disconnected] Removed stale auth folder after LOGOUT');
+                    } catch (e) {
+                        console.error('[disconnected] Failed to remove auth folder', e);
+                    }
+                    reconnectAttempt = 0;
+                } catch (e) {
+                    console.error('[disconnected] Logout cleanup error', e);
+                }
+                // Spawn a fresh child process, then exit this one.
+                spawnRestart();
+                return;
+            }
+
+            scheduleReconnect(`disconnected:${reason}`);
+        });
     c.on('change_state', (state) => console.log('[change_state]', state));
     c.on('loading_screen', (percent, message) => console.log('[loading_screen]', percent, message));
 
-    // Incoming messages (other people -> you)
-    c.on('message', async (msg) => {
-        await handleExpenseMessage('message', msg);
+            // Incoming messages (other people -> you)
+    c.on('message', (msg) => {
+        handleExpenseMessage('message', msg).catch(err =>
+            console.error('[handleExpenseMessage] unhandled', err)
+        );
     });
 
-    // Messages created in the session (includes your own messages; useful for "Message Yourself")
-    c.on('message_create', async (msg) => {
-        await handleExpenseMessage('message_create', msg);
+        // Self-sent messages ("Message Yourself"); keep both 'message' and 'message_create'
+    // because self-chats only fire 'message_create'. Dedup is handled by shouldProcessOnce().
+        c.on('message_create', (msg) => {
+        // Only process your own outgoing messages; ignore echoes of received messages.
+        if (!msg.fromMe) return;
+        handleExpenseMessage('message_create', msg).catch(err =>
+            console.error('[handleExpenseMessage] unhandled', err)
+        );
     });
+}
+
+/**
+ * Spawns a child process running the same script, then exits the current one.
+ * This ensures a clean restart (e.g. after LOGOUT/unlink, auth reset, etc.)
+ */
+function spawnRestart() {
+    console.log('[restart] Spawning fresh instance...');
+    clearInterval(flushInterval);
+    clearTimeout(reconnectTimer);
+
+    const child = fork(__filename, [], {
+        stdio: 'inherit',
+        env: { ...process.env }
+    });
+
+    child.on('error', (err) => {
+        console.error('[restart] Failed to spawn child:', err);
+    });
+
+    // Release lock before exiting so child can acquire it.
+    if (lock?.releaseLock) lock.releaseLock();
+
+    // Give the child a moment to start, then exit.
+    setTimeout(() => {
+        process.exit(0);
+    }, 1000);
 }
 
 startClient();
 
 // Background flush loop so queued items eventually sync even if you don't send new messages.
-setInterval(async () => {
+const flushInterval = setInterval(async () => {
     try {
         const before = sheetsWriter.getQueueSize();
         if (before === 0) return;
@@ -255,3 +341,20 @@ setInterval(async () => {
         console.error('[flush] error', e);
     }
 }, FLUSH_INTERVAL_MS);
+
+// Graceful shutdown: flush queue before exiting.
+async function gracefulShutdown(signal) {
+    console.log(`\n[shutdown] Received ${signal}, flushing queue...`);
+    clearInterval(flushInterval);
+    try {
+        const out = await sheetsWriter.flushWithRetry();
+        console.log(`[shutdown] Flushed: wrote=${out.wrote || 0} remaining=${out.remaining || 0}`);
+    } catch (e) {
+        console.error('[shutdown] Flush error', e);
+    }
+    if (lock?.releaseLock) lock.releaseLock();
+    process.exit(0);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));

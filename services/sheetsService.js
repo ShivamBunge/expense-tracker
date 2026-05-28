@@ -1,3 +1,4 @@
+
 require('dotenv').config();
 const { google } = require('googleapis');
 const auth = require('../config/google-auth');
@@ -30,26 +31,16 @@ async function appendToSheet(expenseData) {
     try {
         const client = await auth.getClient();
         const sheets = google.sheets({ version: 'v4', auth: client });
-        // `values.append` can still shift the destination if Sheets detects the "table"
-        // starting at a different column. To force A:D, we compute the next empty row
-        // based on column A and then do a strict update to A{n}:D{n}.
-        const colA = await sheets.spreadsheets.values.get({
+        // Use values.append to automatically find the next empty row.
+        const res = await sheets.spreadsheets.values.append({
             spreadsheetId,
-            range: `${sheetName}!A:A`
-        });
-        const usedRows = colA.data?.values?.length || 0; // includes header row
-        const nextRow = Math.max(usedRows + 1, 2); // never overwrite header
-        const targetRange = `${sheetName}!A${nextRow}:D${nextRow}`;
-
-        await sheets.spreadsheets.values.update({
-            spreadsheetId,
-            range: targetRange,
+            range: `${sheetName}!A:D`,
             valueInputOption: 'USER_ENTERED',
-            requestBody: {
-                values: [row]
-            }
+            insertDataOption: 'INSERT_ROWS',
+            requestBody: { values: [row] }
         });
-        console.log(`Wrote to range ${targetRange}`);
+        const updatedRange = res.data?.updates?.updatedRange || 'unknown';
+        console.log(`Wrote to range ${updatedRange}`);
         console.log(`Successfully logged: ${expenseData.description} (${expenseData.amount})`);
         return { ok: true };
     } catch (error) {

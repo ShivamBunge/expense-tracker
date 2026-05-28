@@ -45,17 +45,17 @@ function parseExpense(text) {
     let rest = trimmed;
 
     if (match) {
-        const raw = match[1].replace(/[₹$€£\s,]/g, '');
-        const num = parseFloat(raw);
-        amount = isNaN(num) ? '0.00' : num.toFixed(2);
-        rest = trimmed.slice(match[0].length).trim();
-    } else {
-        const tokens = trimmed.split(/\s+/);
-        rest = tokens.slice(1).join(' ').trim();
-    }
+            const raw = match[1].replace(/[₹$€£\s,]/g, '');
+            const num = parseFloat(raw);
+            if (isNaN(num) || num <= 0) return null; // reject zero/negative amounts
+            amount = num.toFixed(2);
+            rest = trimmed.slice(match[0].length).trim();
+        } else {
+            return null; // no valid amount found
+        }
 
     let description = rest || 'Unspecified item';
-    let category = 'Food'; // Default safety fallback
+    let category = 'Other';
 
     const descriptionTokens = description.split(/\s+/).filter(Boolean);
 
@@ -95,7 +95,7 @@ function autoAssignCategory(descriptionText) {
             return cat;
         }
     }
-    return 'Food'; // Default fall back if no keywords match
+    return 'Other';
 }
 
 module.exports = { isValidExpense, parseExpense };
