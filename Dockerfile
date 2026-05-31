@@ -4,7 +4,6 @@ FROM node:22-slim
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-liberation \
-    libappindicator1 \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -37,3 +36,4 @@ ENV NODE_ENV=production
 EXPOSE 3000
 
 CMD ["node", "index.js"]
+
