@@ -1,7 +1,8 @@
 ﻿require('dotenv').config();
 const express = require('express');
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const qrcodeTerminal = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 const { isValidExpense, parseExpense } = require('./services/parserService');
@@ -31,6 +32,7 @@ if (!spreadsheetId) {
 // ---------------------------------------------------------------------------
 let client = null;
 let qrCodeString = null;
+let qrPngBase64 = null;
 let connectionStatus = 'disconnected';
 let reconnectAttempt = 0;
 let reconnectTimer = null;
@@ -107,6 +109,7 @@ async function stopWhatsAppClient() {
     }
     connectionStatus = 'disconnected';
     qrCodeString = null;
+    qrPngBase64 = null;
 }
 
 async function restartWhatsAppClient() {
@@ -168,12 +171,17 @@ function wireClientHandlers(c) {
         qrCodeString = qr;
         connectionStatus = 'awaiting_scan';
         console.log('--- SCAN THIS QR CODE WITH YOUR WHATSAPP ---');
-        qrcode.generate(qr, { small: true });
+        qrcodeTerminal.generate(qr, { small: true });
+        // Generate PNG QR image for the web page
+        QRCode.toDataURL(qr, { width: 256, margin: 2 }).then(url => {
+            qrPngBase64 = url.split(',')[1];
+        }).catch(err => console.error('[qr] PNG generation error', err));
     });
     c.on('ready', () => {
         reconnectAttempt = 0;
         connectionStatus = 'connected';
         qrCodeString = null;
+        qrPngBase64 = null;
         console.log('Expense Bot is authenticated, live, and listening for inputs!');
     });
     c.on('authenticated', () => { connectionStatus = 'authenticated'; console.log('[authenticated] WhatsApp session authenticated'); });
@@ -211,15 +219,25 @@ function requireToken(req, res, next) {
 }
 
 app.get('/', requireToken, (req, res) => {
-    const qrBase64 = qrCodeString ? Buffer.from(qrCodeString).toString('base64') : null;
-    // If the request accepts HTML, show the page; otherwise return JSON
     const acceptsHtml = req.accepts('html');
-    if (acceptsHtml && qrCodeString) {
-        res.send(getQrPage(qrBase64));
+    if (acceptsHtml && qrPngBase64) {
+        // Show QR page with proper PNG image
+        res.send(getQrPage(qrPngBase64));
     } else if (acceptsHtml && connectionStatus === 'connected') {
         res.send(getQrPage(null));
+    } else if (acceptsHtml && connectionStatus === 'awaiting_scan') {
+        // QR exists but maybe not yet generated as PNG; serve a loading page with auto-refresh
+        res.send(`<!DOCTYPE html>
+<html><head><title>Scan QR Code</title>
+<style>
+body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5; }
+.card { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; }
+</style>
+</head>
+<body><div class="card"><h2>Expense Bot</h2><p>Generating QR code, please wait...</p><p class="refresh">Auto-refreshing in 5 seconds</p></div>
+<script>setTimeout(() => location.reload(), 5000);</script></body></html>`);
     } else {
-        res.json({ status: connectionStatus, qr: qrBase64, uptime: process.uptime(), queueSize: sheetsWriter.getQueueSize() });
+        res.json({ status: connectionStatus, uptime: process.uptime(), queueSize: sheetsWriter.getQueueSize() });
     }
 });
 

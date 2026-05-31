@@ -33,22 +33,26 @@ const KEYWORD_MAP = {
 const DEFAULT_CATEGORIES = ['Food', 'Car', 'Medical', 'Shopping', 'House', 'Bills ( Car cleaning, TV, Wifi)', 'Outing', 'Self care', 'Travel', 'Other'];
 
 function isValidExpense(text) {
-    // Accepts optional currency symbol, commas, and decimals at start of message
-    return /^\s*[₹$€£]?\s*[\d,]+(?:\.\d{1,2})?/.test(text.trim());
+    // Accepts optional currency symbol, commas, decimals, and optional leading minus at start of message
+    return /^\s*-?\s*[₹$€£]?\s*[\d,]+(?:\.\d{1,2})?/.test(text.trim());
 }
 
 function parseExpense(text) {
     const trimmed = text.trim();
-    // capture the leading amount (with optional currency symbol)
-    const match = trimmed.match(/^\s*([₹$€£]?\s*[\d,]+(?:\.\d{1,2})?)/);
+    // capture the leading amount (with optional minus, currency symbol)
+    const match = trimmed.match(/^\s*(-?\s*[₹$€£]?\s*[\d,]+(?:\.\d{1,2})?)/);
     let amount = '0.00';
     let rest = trimmed;
 
     if (match) {
-            const raw = match[1].replace(/[₹$€£\s,]/g, '');
+            let raw = match[1].replace(/[₹$€£\s,]/g, '');
+            const isNegative = raw.startsWith('-');
+            if (isNegative) raw = raw.slice(1);
             const num = parseFloat(raw);
             if (isNaN(num) || num <= 0) return null; // reject zero/negative amounts
-            amount = num.toFixed(2);
+            // If user types minus, it's a credit (positive in sheet)
+            // If user types positive, it's a debit (negative in sheet)
+            amount = (isNegative ? num : -num).toFixed(2);
             rest = trimmed.slice(match[0].length).trim();
         } else {
             return null; // no valid amount found
@@ -83,7 +87,7 @@ function parseExpense(text) {
     return {
         timestamp,
         description,
-        amount: `-${amount}`,
+        amount,
         category
     };
 }
