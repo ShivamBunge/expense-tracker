@@ -9,7 +9,6 @@ const { isValidExpense, parseExpense } = require('./services/parserService');
 const { appendToSheet } = require('./services/sheetsService');
 const { createSheetsWriter } = require('./services/queueService');
 const { getLastTransactions, getMonthSummary, getLastMonthSummary } = require('./services/sheetsReaderService');
-const path = require('path');
 
 // ---------------------------------------------------------------------------
 // Config
