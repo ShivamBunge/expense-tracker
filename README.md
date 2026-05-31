@@ -1,13 +1,23 @@
-# Personal WhatsApp Expense Tracker Bot
+# Telegram Expense Bot
 
-An automation script that captures expenses sent via WhatsApp "Message Yourself" and records them into a Google Sheet in real time.
+Log expenses to Google Sheets via Telegram messages.
 
-## Local Setup Instructions
+## Setup
 
-1. Clone this directory.
-2. Run `npm install`.
-3. Put your Google Service Account JSON file in the root directory named `credentials.json`.
-4. Share your Target Google Sheet with the `client_email` listed in your `credentials.json` file as an **Editor**.
-5. Create a `.env` file based on the structure shown below and update your target Spreadsheet ID.
-6. Run `npm start`.
-7. Scan the generated QR code in your terminal with your mobile phone via WhatsApp -> Linked Devices.
+1. `npm install`
+2. Create a `.env` file (see `.env.example`)
+3. Get a Telegram bot token from [@BotFather](https://t.me/BotFather)
+4. Share your Google Sheet with your service account email as Editor
+5. Run `npm start`
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `100 chai` | Log debit (expense) |
+| `-500 salary` | Log credit (income) |
+| `200 pizza Outing` | Log with category |
+| `/last` | Last 5 transactions |
+| `/month` | This month summary |
+| `/lastmonth` | Last month summary |
+| `/help` | Show all commands |
