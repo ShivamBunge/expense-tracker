@@ -1,98 +1,43 @@
-require('dotenv').config();
+﻿require('dotenv').config();
+const express = require('express');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
-const { fork } = require('child_process');
 const { isValidExpense, parseExpense } = require('./services/parserService');
 const { appendToSheet } = require('./services/sheetsService');
-const { acquireLock } = require('./services/singleInstance');
-const { killZombieChromeForSession } = require('./services/windowsChromeCleanup');
 const { createSheetsWriter } = require('./services/queueService');
+const { getQrPage } = require('./services/qrPageService');
 
-const spreadsheetId = process.env.SPREADSHEET_ID;
-if (!spreadsheetId) {
-    console.error('FATAL: SPREADSHEET_ID not set in environment. Copy .env.example to .env and set SPREADSHEET_ID.');
-    process.exit(1);
-}
-
-// Ensure only one instance runs (prevents session lock & duplicates).
-let lock;
-try {
-    lock = acquireLock('expense-bot');
-} catch (e) {
-    console.error(e?.message || e);
-    process.exit(1);
-}
-
-// Best-effort: kill only the bot's stale puppeteer Chrome (Windows).
-const SESSION_DIR = path.join(__dirname, '.wwebjs_auth', 'session');
-const KILL_ZOMBIE_CHROME = String(process.env.KILL_ZOMBIE_CHROME || 'true').toLowerCase() === 'true';
-if (KILL_ZOMBIE_CHROME) {
-    const res = killZombieChromeForSession(SESSION_DIR);
-    if (res.killed > 0) console.log(`[startup] Killed stale chrome PIDs: ${res.pids.join(', ')}`);
-}
-
-let client;
-let reconnectAttempt = 0;
-let reconnectTimer = null;
-let resettingAuth = false;
-const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 5_000);
-const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 120_000);
-
-function computeReconnectDelayMs(attempt) {
-    const exp = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * Math.pow(2, attempt));
-    const jitter = Math.floor(Math.random() * 1_000);
-    return exp + jitter;
-}
-
-function scheduleReconnect(reason) {
-    if (resettingAuth) return;
-    if (reconnectTimer) return;
-    const delay = computeReconnectDelayMs(reconnectAttempt);
-    console.error(`[reconnect] scheduling reconnect in ${delay}ms (attempt=${reconnectAttempt}) reason=${reason}`);
-    reconnectTimer = setTimeout(async () => {
-        reconnectTimer = null;
-        reconnectAttempt += 1;
-        await startClient();
-    }, delay);
-}
-
-async function startClient() {
-    try {
-        if (client) {
-            try {
-                await client.destroy();
-            } catch {
-                // ignore
-            }
-        }
-
-        if (KILL_ZOMBIE_CHROME) {
-            killZombieChromeForSession(SESSION_DIR);
-        }
-
-        client = new Client({
-            authStrategy: new LocalAuth(),
-            puppeteer: {
-                headless: true,
-                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-            }
-        });
-
-        wireClientHandlers(client);
-        await client.initialize();
-    } catch (e) {
-        console.error('[startClient] failed', e);
-        scheduleReconnect('start_failed');
-    }
-}
-
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+const HTTP_PORT = Number(process.env.HTTP_PORT || 3000);
+const API_TOKEN = (process.env.API_TOKEN || '').trim();
 const SELF_ONLY = String(process.env.SELF_ONLY || 'true').toLowerCase() === 'true';
 const SELF_CHAT_ID = (process.env.SELF_CHAT_ID || '').trim();
 const ALLOW_AUTH_RESET = String(process.env.ALLOW_AUTH_RESET || 'false').toLowerCase() === 'true';
 const QUEUE_FILE = process.env.QUEUE_FILE || path.join(__dirname, 'data', 'expense-queue.jsonl');
 const FLUSH_INTERVAL_MS = Number(process.env.FLUSH_INTERVAL_MS || 30_000);
+
+const spreadsheetId = process.env.SPREADSHEET_ID;
+if (!spreadsheetId) {
+    console.error('FATAL: SPREADSHEET_ID not set in environment.');
+    process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let client = null;
+let qrCodeString = null;
+let connectionStatus = 'disconnected';
+let reconnectAttempt = 0;
+let reconnectTimer = null;
+let resettingAuth = false;
+
+const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 5_000);
+const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 120_000);
 
 const sheetsWriter = createSheetsWriter({
     writeFn: appendToSheet,
@@ -101,11 +46,30 @@ const sheetsWriter = createSheetsWriter({
 });
 
 const processedMessageIds = new Set();
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function computeReconnectDelayMs(attempt) {
+    const exp = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * Math.pow(2, attempt));
+    const jitter = Math.floor(Math.random() * 1000);
+    return exp + jitter;
+}
+
+function scheduleReconnect(reason) {
+    if (resettingAuth) return;
+    if (reconnectTimer) return;
+    const delay = computeReconnectDelayMs(reconnectAttempt);
+    console.error('[reconnect] scheduling in', delay, 'ms (attempt=' + reconnectAttempt + ') reason=' + reason);
+    reconnectTimer = setTimeout(async () => {
+        reconnectTimer = null;
+        reconnectAttempt += 1;
+        await startWhatsAppClient();
+    }, delay);
+}
+
 function shouldProcessOnce(msg) {
-    const id =
-        msg?.id?._serialized ||
-        msg?.id?.id ||
-        `${msg?.from}|${msg?.to}|${msg?.timestamp}|${msg?.body}`;
+    const id = msg?.id?._serialized || msg?.id?.id || (msg?.from + '|' + msg?.to + '|' + msg?.timestamp + '|' + msg?.body);
     if (!id) return true;
     if (processedMessageIds.has(id)) return false;
     processedMessageIds.add(id);
@@ -113,248 +77,204 @@ function shouldProcessOnce(msg) {
     return true;
 }
 
-async function handleExpenseMessage(sourceEvent, msg) {
-    console.log(
-        `[${sourceEvent}] from=${msg.from} to=${msg.to} fromMe=${msg.fromMe} body=${JSON.stringify(msg.body)}`
-    );
-    if (!shouldProcessOnce(msg)) return;
+// ---------------------------------------------------------------------------
+// WhatsApp Client
+// ---------------------------------------------------------------------------
+async function startWhatsAppClient() {
+    connectionStatus = 'starting';
+    try {
+        if (client) {
+            try { await client.destroy(); } catch {}
+            client = null;
+        }
+        client = new Client({
+            authStrategy: new LocalAuth(),
+            puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] }
+        });
+        wireClientHandlers(client);
+        await client.initialize();
+    } catch (e) {
+        console.error('[startClient] failed', e);
+        connectionStatus = 'error';
+        scheduleReconnect('start_failed');
+    }
+}
 
-    // If you only want to log expenses from "Message Yourself", keep SELF_ONLY=true (default).
-    // Set SELF_ONLY=false in .env to allow logging from any chat.
+async function stopWhatsAppClient() {
+    if (client) {
+        try { await client.destroy(); } catch {}
+        client = null;
+    }
+    connectionStatus = 'disconnected';
+    qrCodeString = null;
+}
+
+async function restartWhatsAppClient() {
+    console.log('[restart] Restarting WhatsApp client...');
+    resettingAuth = true;
+    await stopWhatsAppClient();
+    await new Promise(r => setTimeout(r, 1000));
+    const authDir = path.join(__dirname, '.wwebjs_auth');
+    try { fs.rmSync(authDir, { recursive: true, force: true }); } catch {}
+    reconnectAttempt = 0;
+    resettingAuth = false;
+    await startWhatsAppClient();
+}
+
+// ---------------------------------------------------------------------------
+// Message handler
+// ---------------------------------------------------------------------------
+async function handleExpenseMessage(sourceEvent, msg) {
+    console.log('[' + sourceEvent + '] from=' + msg.from + ' to=' + msg.to + ' fromMe=' + msg.fromMe + ' body=' + JSON.stringify(msg.body));
+    if (!shouldProcessOnce(msg)) return;
     if (SELF_ONLY) {
-        // WhatsApp sometimes uses @lid chat ids, so msg.to === msg.from is not reliable.
-        // If SELF_CHAT_ID is provided, we strictly match against it.
-        // Example observed: to=105544861933666@lid for "Message Yourself".
         if (SELF_CHAT_ID) {
             const chatId = msg.fromMe ? msg.to : msg.from;
             if (chatId !== SELF_CHAT_ID) return;
         } else {
-            // If message is from you (fromMe === true), it's a self-chat message.
-            // This covers both legacy (msg.to === msg.from) and @lid formats.
-            // Only reject if the message appears to be from someone else.
-            if (!msg.fromMe) {
-                const isNotSelfChat = msg.from !== msg.to;
-                if (isNotSelfChat) return;
-            }
+            if (!msg.fromMe && msg.from !== msg.to) return;
         }
     }
-
     const text = (msg.body || '').trim();
     if (!text) return;
-
-    // Commands (only safe in your allowed chat due to SELF_ONLY filter above)
     if (/^(help|\?)$/i.test(text)) {
-        await msg.reply(
-            [
-                'Commands:',
-                '- help',
-                '- reset auth (requires ALLOW_AUTH_RESET=true)',
-                '',
-                'Log an expense:',
-                '- 120 chai',
-                '- 120 chai Food (or last word as a category)'
-            ].join('\n')
-        );
+        await msg.reply(['Commands:', '- help', '- reset auth (requires ALLOW_AUTH_RESET=true)', '', 'Log an expense:', '- 120 chai', '- 120 chai Food (or last word as a category)'].join('\n'));
         return;
     }
-
-        if (/^reset\s+auth$/i.test(text)) {
-        if (!ALLOW_AUTH_RESET) {
-            await msg.reply('❌ Auth reset is disabled. Set ALLOW_AUTH_RESET=true in .env to enable it.');
-            return;
-        }
-
-        resettingAuth = true;
-        try {
-            // 1. Destroy client to release Chrome and file handles
-            if (client) {
-                try { await client.destroy(); } catch {}
-                client = null;
-            }
-            // 2. Kill any leftover zombie Chrome
-            if (KILL_ZOMBIE_CHROME) {
-                killZombieChromeForSession(SESSION_DIR);
-            }
-            // 3. Wait for files to unlock
-            await new Promise(r => setTimeout(r, 1000));
-            // 4. Remove auth folder
-            const authDir = path.join(__dirname, '.wwebjs_auth');
-            try {
-                fs.rmSync(authDir, { recursive: true, force: true });
-            } catch (e) {
-                console.error('[reset_auth] Failed to remove auth folder', e);
-            }
-        } catch (e) {
-            console.error('[reset_auth] Cleanup error', e);
-        }
-
-        await msg.reply(
-            '✅ Auth reset done.\n' +
-                'Restarting now. Scan the new QR code via WhatsApp → Linked devices → Link a device.'
-        );
-        // Release the lock and spawn a fresh instance.
-        if (lock?.releaseLock) lock.releaseLock();
-        spawnRestart();
+    if (/^reset\s+auth$/i.test(text)) {
+        if (!ALLOW_AUTH_RESET) { await msg.reply('Auth reset is disabled. Set ALLOW_AUTH_RESET=true in .env to enable it.'); return; }
+        await msg.reply('Resetting auth and restarting... Scan the new QR code.');
+        restartWhatsAppClient();
         return;
     }
-
     if (!isValidExpense(text)) return;
-
     const parsedData = parseExpense(text);
-    if (!parsedData) return; // invalid or zero amount
-
+    if (!parsedData) return;
     const metaId = msg?.id?._serialized || msg?.id?.id;
-    const out = await sheetsWriter.recordAndFlush(parsedData, {
-        id: metaId,
-        sourceEvent,
-        from: msg.from,
-        to: msg.to
-    });
-
+    const out = await sheetsWriter.recordAndFlush(parsedData, { id: metaId, sourceEvent, from: msg.from, to: msg.to });
     if (out.ok && (out.remaining || 0) === 0) {
-        await msg.reply(`✅ Logged!\n📝 ${parsedData.description}\n💰 ${parsedData.amount}\n🗂️ ${parsedData.category}`);
+        await msg.reply('Logged! ' + parsedData.description + ' (' + parsedData.amount + ') [' + parsedData.category + ']');
         return;
     }
-
-    // If Sheets is down/transient, we keep the expense queued.
     const remaining = out.remaining ?? sheetsWriter.getQueueSize();
-    await msg.reply(
-        `⚠️ Saved locally, will retry syncing to Google Sheets.\n` +
-            `Queued: ${remaining}\n` +
-            `Last error: ${out.error || 'transient/unavailable'}`
-    );
+    await msg.reply('Saved locally, will retry. Queued: ' + remaining + ' Error: ' + (out.error || 'transient'));
 }
 
+// ---------------------------------------------------------------------------
+// WhatsApp event handlers
+// ---------------------------------------------------------------------------
 function wireClientHandlers(c) {
     c.on('qr', (qr) => {
+        qrCodeString = qr;
+        connectionStatus = 'awaiting_scan';
         console.log('--- SCAN THIS QR CODE WITH YOUR WHATSAPP ---');
         qrcode.generate(qr, { small: true });
     });
-
-        c.on('ready', () => {
-            reconnectAttempt = 0;
-            console.log('Expense Bot is authenticated, live, and listening for inputs!');
-        });
-
-    c.on('authenticated', () => console.log('[authenticated] WhatsApp session authenticated'));
-    c.on('auth_failure', (m) => {
-        console.error('[auth_failure]', m);
-        // Auth failure usually requires QR re-link. We don't auto-delete auth here;
-        // user can send "reset auth" (if enabled) or manually delete auth folder.
-        scheduleReconnect('auth_failure');
+    c.on('ready', () => {
+        reconnectAttempt = 0;
+        connectionStatus = 'connected';
+        qrCodeString = null;
+        console.log('Expense Bot is authenticated, live, and listening for inputs!');
     });
-        c.on('disconnected', async (reason) => {
-            console.error('[disconnected]', reason);
-
-            // On LOGOUT (user unlinked from phone): clean everything and restart fresh.
-            if (/logout/i.test(String(reason))) {
-                console.log('[disconnected] Device was unlinked from WhatsApp. Wiping auth and restarting...');
-                try {
-                    if (client) {
-                        try { await client.destroy(); } catch {}
-                        client = null;
-                    }
-                    if (KILL_ZOMBIE_CHROME) {
-                        killZombieChromeForSession(SESSION_DIR);
-                    }
-                    // Wait for Chrome to fully exit and release file locks.
-                    await new Promise(r => setTimeout(r, 2000));
-                    const authDir = path.join(__dirname, '.wwebjs_auth');
-                    try {
-                        fs.rmSync(authDir, { recursive: true, force: true });
-                        console.log('[disconnected] Removed stale auth folder after LOGOUT');
-                    } catch (e) {
-                        console.error('[disconnected] Failed to remove auth folder', e);
-                    }
-                    reconnectAttempt = 0;
-                } catch (e) {
-                    console.error('[disconnected] Logout cleanup error', e);
-                }
-                // Spawn a fresh child process, then exit this one.
-                spawnRestart();
-                return;
-            }
-
-            scheduleReconnect(`disconnected:${reason}`);
-        });
+    c.on('authenticated', () => { connectionStatus = 'authenticated'; console.log('[authenticated] WhatsApp session authenticated'); });
+    c.on('auth_failure', (m) => { console.error('[auth_failure]', m); connectionStatus = 'auth_failure'; scheduleReconnect('auth_failure'); });
+    c.on('disconnected', async (reason) => {
+        console.error('[disconnected]', reason);
+        connectionStatus = 'disconnected';
+        if (/logout/i.test(String(reason))) {
+            console.log('[disconnected] Device was unlinked. Wiping auth and restarting client...');
+            restartWhatsAppClient();
+            return;
+        }
+        scheduleReconnect('disconnected:' + reason);
+    });
     c.on('change_state', (state) => console.log('[change_state]', state));
     c.on('loading_screen', (percent, message) => console.log('[loading_screen]', percent, message));
-
-            // Incoming messages (other people -> you)
-    c.on('message', (msg) => {
-        handleExpenseMessage('message', msg).catch(err =>
-            console.error('[handleExpenseMessage] unhandled', err)
-        );
-    });
-
-        // Self-sent messages ("Message Yourself"); keep both 'message' and 'message_create'
-    // because self-chats only fire 'message_create'. Dedup is handled by shouldProcessOnce().
-        c.on('message_create', (msg) => {
-        // Only process your own outgoing messages; ignore echoes of received messages.
-        if (!msg.fromMe) return;
-        handleExpenseMessage('message_create', msg).catch(err =>
-            console.error('[handleExpenseMessage] unhandled', err)
-        );
-    });
+    c.on('message', (msg) => { handleExpenseMessage('message', msg).catch(err => console.error('[handleExpenseMessage] unhandled', err)); });
+    c.on('message_create', (msg) => { if (!msg.fromMe) return; handleExpenseMessage('message_create', msg).catch(err => console.error('[handleExpenseMessage] unhandled', err)); });
 }
 
-/**
- * Spawns a child process running the same script, then exits the current one.
- * This ensures a clean restart (e.g. after LOGOUT/unlink, auth reset, etc.)
- */
-function spawnRestart() {
-    console.log('[restart] Spawning fresh instance...');
-    clearInterval(flushInterval);
-    clearTimeout(reconnectTimer);
+// ---------------------------------------------------------------------------
+// Express server
+// ---------------------------------------------------------------------------
+const app = express();
+app.use(express.json());
 
-    const child = fork(__filename, [], {
-        stdio: 'inherit',
-        env: { ...process.env }
-    });
-
-    child.on('error', (err) => {
-        console.error('[restart] Failed to spawn child:', err);
-    });
-
-    // Release lock before exiting so child can acquire it.
-    if (lock?.releaseLock) lock.releaseLock();
-
-    // Give the child a moment to start, then exit.
-    setTimeout(() => {
-        process.exit(0);
-    }, 1000);
+// Protect API endpoints with a token (set API_TOKEN in .env)
+function requireToken(req, res, next) {
+    if (!API_TOKEN) return next(); // No token configured = open access
+    const provided = req.query.token || req.headers['x-api-token'];
+    if (provided !== API_TOKEN) {
+        return res.status(401).json({ error: 'Unauthorized. Provide ?token= or x-api-token header' });
+    }
+    next();
 }
 
-startClient();
+app.get('/', requireToken, (req, res) => {
+    const qrBase64 = qrCodeString ? Buffer.from(qrCodeString).toString('base64') : null;
+    // If the request accepts HTML, show the page; otherwise return JSON
+    const acceptsHtml = req.accepts('html');
+    if (acceptsHtml && qrCodeString) {
+        res.send(getQrPage(qrBase64));
+    } else if (acceptsHtml && connectionStatus === 'connected') {
+        res.send(getQrPage(null));
+    } else {
+        res.json({ status: connectionStatus, qr: qrBase64, uptime: process.uptime(), queueSize: sheetsWriter.getQueueSize() });
+    }
+});
 
-// Background flush loop so queued items eventually sync even if you don't send new messages.
+app.post('/restart', requireToken, (req, res) => {
+    console.log('[HTTP] Manual restart requested');
+    restartWhatsAppClient();
+    res.json({ ok: true, message: 'Restarting WhatsApp client...' });
+});
+
+app.post('/shutdown', requireToken, (req, res) => {
+    res.json({ ok: true, message: 'Shutting down...' });
+    setImmediate(() => gracefulShutdown('HTTP_SHUTDOWN'));
+});
+
+const HOST = process.env.HTTP_HOST || '0.0.0.0';
+app.listen(HTTP_PORT, HOST, () => {
+    console.log('[server] HTTP server listening on http://' + HOST + ':' + HTTP_PORT);
+    const tokenInfo = API_TOKEN ? 'with token auth' : '(no API_TOKEN set - open access)';
+    console.log('[server] Status: http://localhost:' + HTTP_PORT + '/?token=' + API_TOKEN + ' ' + tokenInfo);
+});
+
+// ---------------------------------------------------------------------------
+// Flush loop
+// ---------------------------------------------------------------------------
 const flushInterval = setInterval(async () => {
     try {
         const before = sheetsWriter.getQueueSize();
         if (before === 0) return;
         const out = await sheetsWriter.flushWithRetry();
         const after = sheetsWriter.getQueueSize();
-        if (after !== before) {
-            console.log(`[flush] wrote=${out.wrote || 0} remaining=${after}`);
-        }
-    } catch (e) {
-        console.error('[flush] error', e);
-    }
+        if (after !== before) console.log('[flush] wrote=' + (out.wrote || 0) + ' remaining=' + after);
+    } catch (e) { console.error('[flush] error', e); }
 }, FLUSH_INTERVAL_MS);
 
-// Graceful shutdown: flush queue before exiting.
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+startWhatsAppClient();
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
 async function gracefulShutdown(signal) {
-    console.log(`\n[shutdown] Received ${signal}, flushing queue...`);
+    console.log('[shutdown] Received ' + signal + ', flushing queue...');
     clearInterval(flushInterval);
+    clearTimeout(reconnectTimer);
     try {
         const out = await sheetsWriter.flushWithRetry();
-        console.log(`[shutdown] Flushed: wrote=${out.wrote || 0} remaining=${out.remaining || 0}`);
-    } catch (e) {
-        console.error('[shutdown] Flush error', e);
-    }
-    if (lock?.releaseLock) lock.releaseLock();
+        console.log('[shutdown] Flushed: wrote=' + (out.wrote || 0) + ' remaining=' + (out.remaining || 0));
+    } catch (e) { console.error('[shutdown] Flush error', e); }
+    if (client) { try { await client.destroy(); } catch {} }
     process.exit(0);
 }
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('uncaughtException', (err) => { console.error('[uncaughtException]', err.message); });
+process.on('unhandledRejection', (err) => { console.error('[unhandledRejection]', err); });

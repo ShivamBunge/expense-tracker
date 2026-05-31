@@ -74,8 +74,8 @@ function parseExpense(text) {
         category = autoAssignCategory(description);
     }
 
-    // Generates Ist Timestamp (Asia/Kolkata) matching your sheet layout
-    const timestamp = new Date().toLocaleString('en-IN', {
+        // Generates IST Timestamp (Asia/Kolkata) in M/D/YYYY H:MM:SS 24-hr format
+    const timestamp = new Date().toLocaleString('en-US', {
         timeZone: 'Asia/Kolkata',
         hour12: false
     }).replace(',', '');
