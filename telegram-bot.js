@@ -1,4 +1,9 @@
 require('dotenv').config();
+const path = require('path');
+
+// Health check server for Render
+require('./health-server');
+
 const TelegramBot = require('node-telegram-bot-api');
 const { isValidExpense, parseExpense } = require('./services/parserService');
 const { appendToSheet } = require('./services/sheetsService');
